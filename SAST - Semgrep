@@ -3,45 +3,57 @@ pipeline {
 
   parameters {
     booleanParam(name: 'FAIL_ON_FINDINGS', defaultValue: false, description: 'Si true -> el job falla si hay vulnerabilidades.')
+    string(name: 'SEMGREP_CONFIG', defaultValue: 'auto', description: 'Configuración para semgrep (ej: auto, ruta/a/reglas.yml, o un pack como p/owasp-top-10).')
+    string(name: 'SRC', defaultValue: '/projects/Cyberfinance-Bank-main', description: 'Ruta fuente en el nodo donde están los repositorios/proyectos.')
+    string(name: 'ANALYZE_TARGETS', defaultValue: 'Backend,Frontend', description: 'Targets a analizar (CSV), p.ej. Backend,Frontend o src/dir1,src/dir2.')
   }
 
   environment {
-    SRC = '/projects/Cyberfinance-Bank-main'
     IMG = 'returntocorp/semgrep:latest'
-    ANALYZE_TARGETS = 'Backend,Frontend'
   }
 
   stages {
     stage('Prepare workspace (rsync without owner/perms)') {
       steps {
-        sh '''
+        // interpolamos params.SRC y env.WORKSPACE desde Groovy (GString)
+        sh """
           set -e
-          rm -rf "$WORKSPACE"/* || true
-          rsync -r --delete --exclude='.git' --exclude='node_modules' \
-            --no-owner --no-group --no-perms \
-            --chmod=Du=rwx,Dg=rx,Do=rx,Fu=rw,Fg=r,Fo=r \
-            "${SRC}/" "$WORKSPACE/"
+          rm -rf "${env.WORKSPACE}"/* || true
+          rsync -r --delete --exclude='.git' --exclude='node_modules' \\
+            --no-owner --no-group --no-perms \\
+            --chmod=Du=rwx,Dg=rx,Do=rx,Fu=rw,Fg=r,Fo=r \\
+            "${params.SRC}/" "${env.WORKSPACE}/"
           echo "Permisos y contenido del workspace:"
-          ls -ld "$WORKSPACE"
-          ls -l "$WORKSPACE" | head -n 50
-        '''
+          ls -ld "${env.WORKSPACE}"
+          ls -l "${env.WORKSPACE}" | head -n 50
+        """
       }
     }
 
     stage('Semgrep (sequential)') {
       steps {
         script {
-          def targets = (env.ANALYZE_TARGETS ?: '').tokenize(',').collect { it.trim() }.findAll { it }
+          // tomar el parámetro SEMGREP_CONFIG (fallback a 'auto')
+          def config = (params.SEMGREP_CONFIG ?: 'auto').trim()
+          echo "SEMGREP_CONFIG seleccionado: '${config}'"
+
+          // obtener uid/gid del agente (números) para pasar a docker -u
+          def uid = sh(script: 'id -u', returnStdout: true).trim()
+          def gid = sh(script: 'id -g', returnStdout: true).trim()
+          echo "Usando UID:GID = ${uid}:${gid} para docker run"
+
+          // parsear targets desde el parámetro ANALYZE_TARGETS
+          def targets = (params.ANALYZE_TARGETS ?: '').tokenize(',').collect { it.trim() }.findAll { it }
           if (targets.isEmpty()) {
             echo "ANALYZE_TARGETS vacío — nothing to scan."
           } else {
             for (t in targets) {
               def safe = t.replaceAll(/[\\/\\s]+/, '-')
-              echo "Analizando target: ${t} -> semgrep-${safe}.json"
+              echo "Analizando target: ${t} -> semgrep-${safe}.json (config=${config})"
               sh """
                 set -e
-                docker run --rm -u "\$(id -u):\$(id -g)" -e HOME=/tmp -v "$WORKSPACE":/src ${IMG} \\
-                  semgrep scan --config=auto --json --output /src/semgrep-${safe}.json /src/${t} || true
+                docker run --rm -u ${uid}:${gid} -e HOME=/tmp -v "${env.WORKSPACE}":/src ${IMG} \\
+                  semgrep scan --config='${config}' --json --output /src/semgrep-${safe}.json /src/${t} || true
               """
             }
           }
@@ -56,6 +68,7 @@ pipeline {
 
     stage('Summarize & conditional exit') {
       steps {
+        // usamos comillas simples triples para evitar que Groovy intente interpolar $f, $cnt, etc.
         sh '''
           set -euo pipefail
 
@@ -84,7 +97,7 @@ pipeline {
 
           cat semgrep-report-summary.txt
 
-          # decidir exit según FAIL_ON_FINDINGS
+          # decidir exit según FAIL_ON_FINDINGS (parametro exportado por Jenkins)
           if [ "${FAIL_ON_FINDINGS:-false}" = "true" ] && [ "${total:-0}" -gt 0 ]; then
             echo "FAIL_ON_FINDINGS=true y total>0 -> saliendo con código 1"
             exit 1
@@ -101,10 +114,10 @@ pipeline {
       }
     }
 
-  } 
+  } // end stages
 
   post {
     success { echo "Security pipeline: final SUCCESS." }
     failure { echo "Security pipeline: final FAILURE (revisa artefactos)." }
   }
-} 
+}
