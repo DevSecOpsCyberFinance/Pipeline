@@ -2,12 +2,13 @@ pipeline {
   agent any
 
   parameters {
-    booleanParam(name: 'FAIL_ON_FINDINGS', defaultValue: false, description: 'Si true -> el job falla si hay vulnerabilidades. Si false -> siempre SUCCESS.')
+    booleanParam(name: 'FAIL_ON_FINDINGS', defaultValue: false, description: 'Si true -> el job falla si hay vulnerabilidades.')
   }
 
   environment {
     SRC = '/projects/Cyberfinance-Bank-main'
     IMG = 'returntocorp/semgrep:latest'
+    ANALYZE_TARGETS = 'Backend,Frontend'
   }
 
   stages {
@@ -19,12 +20,7 @@ pipeline {
           rsync -r --delete --exclude='.git' --exclude='node_modules' \
             --no-owner --no-group --no-perms \
             --chmod=Du=rwx,Dg=rx,Do=rx,Fu=rw,Fg=r,Fo=r \
-            "${SRC}/" "$WORKSPACE/" 2>/dev/null || {
-              echo "rsync falló, fallback con tar..."
-              (cd "${SRC}" && tar -c .) | tar -x -C "$WORKSPACE"
-              find "$WORKSPACE" -type d -print0 | xargs -0 chmod 755 || true
-              find "$WORKSPACE" -type f -print0 | xargs -0 chmod 644 || true
-            }
+            "${SRC}/" "$WORKSPACE/"
           echo "Permisos y contenido del workspace:"
           ls -ld "$WORKSPACE"
           ls -l "$WORKSPACE" | head -n 50
@@ -32,63 +28,68 @@ pipeline {
       }
     }
 
-    stage('Semgrep - Backend') {
+    stage('Semgrep (sequential)') {
       steps {
-        sh '''
-          set -e
-          docker run --rm -u "$(id -u):$(id -g)" -e HOME=/tmp -v "$WORKSPACE":/src ${IMG} \
-            semgrep scan --config=auto --json --output /src/semgrep-backend.json /src/Backend || true
-        '''
+        script {
+          def targets = (env.ANALYZE_TARGETS ?: '').tokenize(',').collect { it.trim() }.findAll { it }
+          if (targets.isEmpty()) {
+            echo "ANALYZE_TARGETS vacío — nothing to scan."
+          } else {
+            for (t in targets) {
+              def safe = t.replaceAll(/[\\/\\s]+/, '-')
+              echo "Analizando target: ${t} -> semgrep-${safe}.json"
+              sh """
+                set -e
+                docker run --rm -u "\$(id -u):\$(id -g)" -e HOME=/tmp -v "$WORKSPACE":/src ${IMG} \\
+                  semgrep scan --config=auto --json --output /src/semgrep-${safe}.json /src/${t} || true
+              """
+            }
+          }
+        }
       }
-      post { always { archiveArtifacts artifacts: 'semgrep-backend.json', allowEmptyArchive: true, fingerprint: true } }
-    }
-
-    stage('Semgrep - Frontend') {
-      steps {
-        sh '''
-          set -e
-          docker run --rm -u "$(id -u):$(id -g)" -e HOME=/tmp -v "$WORKSPACE":/src ${IMG} \
-            semgrep scan --config=auto --json --output /src/semgrep-frontend.json /src/Frontend || true
-        '''
+      post {
+        always {
+          archiveArtifacts artifacts: 'semgrep-*.json', allowEmptyArchive: true, fingerprint: true
+        }
       }
-      post { always { archiveArtifacts artifacts: 'semgrep-frontend.json', allowEmptyArchive: true, fingerprint: true } }
     }
 
     stage('Summarize & conditional exit') {
       steps {
         sh '''
-          set -e
+          set -euo pipefail
 
-          # contar backend
-          backend_count=$( [ -f semgrep-backend.json ] && \
-            python3 -c "import json,sys; print(len(json.load(open('semgrep-backend.json')).get('results',[])))" 2>/dev/null || echo 0 )
+          rm -f semgrep-report-summary.txt
+          total=0
 
-          # contar frontend
-          frontend_count=$( [ -f semgrep-frontend.json ] && \
-            python3 -c "import json,sys; print(len(json.load(open('semgrep-frontend.json')).get('results',[])))" 2>/dev/null || echo 0 )
+          for f in semgrep-*.json; do
+            [ -f "$f" ] || continue
 
-          # asegurar que sean enteros
-          backend_count=${backend_count:-0}
-          frontend_count=${frontend_count:-0}
-          total=$(( backend_count + frontend_count ))
+            # contar 'results' con python (una sola línea)
+            cnt=$(python3 -c "import json,sys; print(len(json.load(open(sys.argv[1])).get('results',[])))" "$f" 2>/dev/null || echo 0)
 
-          # escribir resumen con breakdown
-          cat > semgrep-report-summary.txt <<EOF
-backend_findings=${backend_count}
-frontend_findings=${frontend_count}
-total_findings=${total}
-EOF
+            # sanitizar cnt
+            case "$cnt" in ''|*[!0-9]*) cnt=0 ;; esac
 
-          echo "Findings breakdown: Backend: ${backend_count} — Frontend: ${frontend_count} — Total: ${total}"
+            echo "$f=$cnt" >> semgrep-report-summary.txt
+            total=$(( total + cnt ))
+          done
 
-          # decidir exit según el parámetro FAIL_ON_FINDINGS
-          # Jenkins inyecta el parámetro como string "true"/"false"
-          if [ "${FAIL_ON_FINDINGS}" = "true" ] && [ "${total}" -gt 0 ]; then
+          # asegurar que exista el resumen
+          if [ ! -f semgrep-report-summary.txt ]; then
+            echo "total_findings=0" > semgrep-report-summary.txt
+          else
+            echo "total_findings=${total}" >> semgrep-report-summary.txt
+          fi
+
+          cat semgrep-report-summary.txt
+
+          # decidir exit según FAIL_ON_FINDINGS
+          if [ "${FAIL_ON_FINDINGS:-false}" = "true" ] && [ "${total:-0}" -gt 0 ]; then
             echo "FAIL_ON_FINDINGS=true y total>0 -> saliendo con código 1"
             exit 1
           fi
 
-          echo "Salida exit 0 (no hay findings o FAIL_ON_FINDINGS=false)"
           exit 0
         '''
       }
@@ -99,10 +100,11 @@ EOF
         }
       }
     }
-  }
+
+  } 
 
   post {
     success { echo "Security pipeline: final SUCCESS." }
     failure { echo "Security pipeline: final FAILURE (revisa artefactos)." }
   }
-}
+} 
