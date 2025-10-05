@@ -33,7 +33,6 @@ pipeline {
           if (params.LOCAL_REPORT_DIR?.trim()) {
             echo "Copiando desde LOCAL_REPORT_DIR: ${params.LOCAL_REPORT_DIR}"
             sh "cp -a '${params.LOCAL_REPORT_DIR}'/. '${DOWNLOAD_DIR}/' || true"
-            // comprobar si hay json
             got = sh(script: "bash -c 'shopt -s nullglob; files=(\"${DOWNLOAD_DIR}\"/**/*.json); if [ \"\${#files[@]}\" -gt 0 ]; then exit 0; else exit 1; fi'", returnStatus: true) == 0
             if (got) { echo "Reportes copiados desde local." }
           }
@@ -66,11 +65,9 @@ pipeline {
     stage('Count vulnerabilities') {
       steps {
         script {
-          // Totales serializables simples
           def totals = [Critica:0, Alta:0, Media:0, Baja:0, Informativa:0]
           def perFile = []
 
-          // obtener lista de archivos JSON (no guardamos objetos no-serializables)
           def jsonFiles = []
           try {
             def found = findFiles(glob: "${DOWNLOAD_DIR}/**/*.json")
@@ -87,7 +84,6 @@ pipeline {
             echo "Advertencia: no se encontraron JSONs en ${DOWNLOAD_DIR}."
           }
 
-          // Procesar cada archivo: usar readJSON (pipeline-step seguro) o readFile+parse (pero parsear inmediatamente)
           jsonFiles.each { path ->
             try {
               // readJSON es seguro desde Pipeline Utility Steps (si no lo tenés, instalalo).
@@ -139,7 +135,6 @@ pipeline {
           def result = [generatedAt:new Date().toString(), totals:totals, files:perFile]
           writeFile file: "${OUT_DIR}/vulnerability-summary.json", text: groovy.json.JsonOutput.prettyPrint(groovy.json.JsonOutput.toJson(result))
 
-          // Markdown readable - VERSIÓN CORREGIDA SIN StringBuilder
           def mdLines = []
           mdLines.add("# Resumen de vulnerabilidades (Snyk)")
           mdLines.add("")
@@ -173,7 +168,7 @@ pipeline {
         sh "echo '--- Resumen (markdown) ---'; sed -n '1,200p' '${OUT_DIR}/vulnerability-summary.md' || true"
       }
     }
-  } // stages
+  } 
 
   post {
     always { echo "ContadorVulnerabilidadesSynk terminado." }
