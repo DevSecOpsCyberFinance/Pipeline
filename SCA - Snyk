@@ -1,0 +1,127 @@
+pipeline {
+  agent any
+
+  parameters {
+    string(name: 'TARGET_PATHS', defaultValue: '/projects/Cyberfinance-Bank-main/Frontend/', description: 'Lista de rutas donde buscar proyectos. Separar por coma o nueva línea.')
+    string(name: 'SNYK_CREDENTIAL_ID', defaultValue: 'Synk-DevSecOps-cli', description: 'Jenkins credential ID (Secret text) que contiene el token de Snyk.')
+    string(name: 'SNYK_TOOL_NAME', defaultValue: 'Snyk', description: 'Nombre de la instalación de Snyk en Jenkins Global Tool Configuration (si usás tool).')
+    booleanParam(name: 'FAIL_PIPE_ON_CRITICAL', defaultValue: false, description: 'Si true -> marcar build FAILED si algún scan retorna código crítico. Si false -> continúa y archiva reportes.')
+  }
+
+  environment {
+    REPORT_DIR = "${env.WORKSPACE}/snyk-reports"
+    TARGETS_DIR = "${env.WORKSPACE}/targets"
+  }
+
+  stages {
+
+    stage('Prepare workspace') {
+      steps {
+        echo "Workspace: ${env.WORKSPACE}"
+        sh "rm -rf '${REPORT_DIR}' '${TARGETS_DIR}' || true && mkdir -p '${REPORT_DIR}' '${TARGETS_DIR}'"
+      }
+    }
+
+    stage('Parse target list') {
+      steps {
+        script {
+          def raw = params.TARGET_PATHS ?: ''
+          def arr = raw.split('[,\\n\\r]+').collect { it.trim() }.findAll { it }
+          if (arr.size() == 0) { error "No se recibieron rutas válidas en TARGET_PATHS (valor: '${raw}')." }
+          echo "Targets to scan (${arr.size()}): ${arr}"
+          env.__TARGETS = arr.join(';;')
+        }
+      }
+    }
+    
+    stage('Scan each target with Snyk CLI') {
+      steps {
+        script {
+          try {
+            def resolved = tool params.SNYK_TOOL_NAME
+            env.SNYK_HOME = resolved
+            echo "SNYK_HOME resolved to: ${env.SNYK_HOME}"
+          } catch (e) {
+            echo "Warning: no se pudo resolver Snyk tool '${params.SNYK_TOOL_NAME}': ${e}. Se usará 'snyk' del PATH si está disponible."
+            env.SNYK_HOME = ''
+          }
+
+          def targets = env.__TARGETS.split(';;')
+          for (int i = 0; i < targets.length; i++) {
+            def target = targets[i].trim()
+            if (!target) { echo "Ruta vacía, salto"; continue }
+            def safeName = target.replaceAll(/[\\\/\s]+/, '_').replaceAll(/[^A-Za-z0-9_.-]/, '')
+            def dest = "${TARGETS_DIR}/${safeName}"
+            echo "==> (${i+1}/${targets.length}) Procesando: ${target}  -> copia a: ${dest}"
+    
+            boolean copiedOk = false
+            try {
+              sh """
+                rm -rf '${dest}' || true
+                mkdir -p '${dest}'
+                cp -a '${target}'/. '${dest}/' || { echo 'ERROR copying ${target}'; exit 2; }
+              """
+              copiedOk = true
+              sh "ls -la '${dest}' | sed -n '1,200p'"
+            } catch (err) {
+              echo "WARNING: No se pudo copiar '${target}' al workspace: ${err}"
+              writeFile file: "${REPORT_DIR}/snyk-${safeName}.json", text: "{\"error\":\"could not copy source: ${target}\"}"
+              copiedOk = false
+            }
+    
+            if (copiedOk) {
+              withCredentials([string(credentialsId: params.SNYK_CREDENTIAL_ID, variable: 'SNYK_TOKEN')]) {
+                try {
+                  sh '''
+                    set -e
+                    cd "${dest}"
+                    if [ -n "${SNYK_HOME}" ] && [ -x "${SNYK_HOME}/snyk" ]; then
+                      SNYK_BIN="${SNYK_HOME}/snyk"
+                    else
+                      SNYK_BIN="snyk"
+                    fi
+                    echo "Using Snyk binary: $SNYK_BIN"
+                    # Auth: no fallamos si ya está autenticado -> capturamos el resultado con || true
+                    $SNYK_BIN auth "$SNYK_TOKEN" || true
+                    # Ejecutamos el test y volcamos JSON al REPORT_DIR
+                    $SNYK_BIN test --json > "${REPORT_DIR}/snyk-${safeName}.json" || true
+                  '''
+                } catch (err2) {
+                  echo "WARNING: Error ejecutando Snyk sobre ${dest}: ${err2}"
+                  writeFile file: "${REPORT_DIR}/snyk-${safeName}.json", text: "{\"error\":\"snyk execution failed for ${dest}\"}"
+                }
+              }
+            } else {
+              echo "Skipping Snyk for ${target} because copy failed."
+            }
+    
+          } 
+        } 
+      } 
+    }
+
+
+    stage('Archive all reports') {
+      steps {
+        script {
+          sh "ls -la '${REPORT_DIR}' || true"
+        }
+        archiveArtifacts artifacts: 'snyk-reports/**', fingerprint: true, allowEmptyArchive: true
+      }
+    }
+
+  } 
+
+  post {
+    always {
+      echo "Pipeline finalizado. Los reportes están en: ${env.WORKSPACE}/snyk-reports"
+      sh "ls -la '${env.WORKSPACE}/snyk-reports' || true"
+    }
+    failure {
+      echo "El pipeline terminó con FAILURE."
+    }
+    success {
+      echo "El pipeline terminó con SUCCESS."
+    }
+  }
+}
