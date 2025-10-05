@@ -1,0 +1,192 @@
+pipeline {
+  agent any
+
+  parameters {
+    string(name: 'SNYK_SOURCE_JOB', defaultValue: 'SCA - Snyk', description: 'Nombre del job que contiene los artefactos Snyk (opcional).')
+    string(name: 'SNYK_BUILD_NUMBER', defaultValue: '', description: 'Número de build del job fuente. Si vacío: último successful.')
+    string(name: 'REPORT_GLOB', defaultValue: 'snyk-reports/**/*.json', description: 'Patrón para localizar los JSON dentro del ZIP/dir.')
+    string(name: 'LOCAL_REPORT_DIR', defaultValue: '', description: 'Carpeta local con reportes (ruta en el agent).')
+    string(name: 'JENKINS_URL', defaultValue: '', description: 'URL base de Jenkins (ej. http://jenkins:8080). Si vacío usa env.JENKINS_URL o localhost.')
+    string(name: 'JENKINS_USER_CRED_ID', defaultValue: '', description: 'Credential ID (Username/Password) para autenticar al descargar artefactos (opcional).')
+    booleanParam(name: 'FAIL_ON_CRITICAL', defaultValue: false, description: 'Si true -> falla el build si total Crítica > 0.')
+  }
+
+  environment {
+    DOWNLOAD_DIR = "${env.WORKSPACE}/downloaded-reports"
+    OUT_DIR = "${env.WORKSPACE}/contador-output"
+  }
+
+  options { timestamps() }
+
+  stages {
+    stage('Prepare') {
+      steps {
+        sh "rm -rf '${DOWNLOAD_DIR}' '${OUT_DIR}' || true && mkdir -p '${DOWNLOAD_DIR}' '${OUT_DIR}'"
+      }
+    }
+
+    stage('Obtain reports (local or Copy Artifact)') {
+      steps {
+        script {
+          boolean got = false
+
+          if (params.LOCAL_REPORT_DIR?.trim()) {
+            echo "Copiando desde LOCAL_REPORT_DIR: ${params.LOCAL_REPORT_DIR}"
+            sh "cp -a '${params.LOCAL_REPORT_DIR}'/. '${DOWNLOAD_DIR}/' || true"
+            // comprobar si hay json
+            got = sh(script: "bash -c 'shopt -s nullglob; files=(\"${DOWNLOAD_DIR}\"/**/*.json); if [ \"\${#files[@]}\" -gt 0 ]; then exit 0; else exit 1; fi'", returnStatus: true) == 0
+            if (got) { echo "Reportes copiados desde local." }
+          }
+
+          if (!got && params.SNYK_SOURCE_JOB?.trim()) {
+            echo "Intentando copiar artefactos desde job: ${params.SNYK_SOURCE_JOB} (build: ${params.SNYK_BUILD_NUMBER ?: 'last successful'})"
+            try {
+              if (params.SNYK_BUILD_NUMBER?.trim()) {
+                copyArtifacts projectName: params.SNYK_SOURCE_JOB, selector: [$class: 'SpecificBuildSelector', buildNumber: params.SNYK_BUILD_NUMBER], filter: params.REPORT_GLOB, target: DOWNLOAD_DIR
+              } else {
+                copyArtifacts projectName: params.SNYK_SOURCE_JOB, selector: [$class: 'StatusBuildSelector', stable: true], filter: params.REPORT_GLOB, target: DOWNLOAD_DIR
+              }
+              got = true
+              echo "Artefactos copiados a ${DOWNLOAD_DIR}"
+            } catch (err) {
+              echo "WARNING: copyArtifacts falló: ${err}"
+              got = false
+            }
+          }
+
+          if (!got) {
+            error("No se pudieron obtener reportes. Usá LOCAL_REPORT_DIR o asegurate que SNYK_SOURCE_JOB exista y tenga artefactos.")
+          }
+
+          sh "echo 'Contenido descargado (max 200):'; find '${DOWNLOAD_DIR}' -type f -name '*.json' -print | sed -n '1,200p' || true"
+        }
+      }
+    }
+
+    stage('Count vulnerabilities') {
+      steps {
+        script {
+          // Totales serializables simples
+          def totals = [Critica:0, Alta:0, Media:0, Baja:0, Informativa:0]
+          def perFile = []
+
+          // obtener lista de archivos JSON (no guardamos objetos no-serializables)
+          def jsonFiles = []
+          try {
+            def found = findFiles(glob: "${DOWNLOAD_DIR}/**/*.json")
+            found.each { jsonFiles << it.path }
+            echo "findFiles encontró ${found.length} json(s)."
+          } catch (e) {
+            echo "findFiles no disponible => uso find shell"
+            def out = sh(script: "find '${DOWNLOAD_DIR}' -type f -name '*.json' -print", returnStdout: true).trim()
+            if (out) out.split('\\n').each { jsonFiles << it }
+            echo "Shell find encontró ${jsonFiles.size()} json(s)."
+          }
+
+          if (jsonFiles.size() == 0) {
+            echo "Advertencia: no se encontraron JSONs en ${DOWNLOAD_DIR}."
+          }
+
+          // Procesar cada archivo: usar readJSON (pipeline-step seguro) o readFile+parse (pero parsear inmediatamente)
+          jsonFiles.each { path ->
+            try {
+              // readJSON es seguro desde Pipeline Utility Steps (si no lo tenés, instalalo).
+              def parsed = null
+              try {
+                parsed = readJSON file: path
+              } catch (readErr) {
+                // fallback: leer y parsear localmente (pero no mantener JsonSlurper en variable amplia)
+                def text = readFile(file: path)
+                parsed = new groovy.json.JsonSlurperClassic().parseText(text)
+              }
+
+              def vulns = []
+              if (parsed instanceof Map) {
+                if (parsed.vulnerabilities instanceof Collection) {
+                  vulns = parsed.vulnerabilities
+                } else if (parsed.vulns instanceof Map) {
+                  vulns = parsed.vulns.values().toList()
+                } else if (parsed.issues instanceof Map && parsed.issues.vulnerabilities instanceof Collection) {
+                  vulns = parsed.issues.vulnerabilities
+                } else {
+                  // intentar agregar arrays encontrados
+                  parsed.values().findAll{ it instanceof Collection }.each { c -> vulns.addAll(c) }
+                }
+              } else if (parsed instanceof Collection) {
+                vulns = parsed
+              }
+
+              def counts = [Critica:0, Alta:0, Media:0, Baja:0, Informativa:0]
+              vulns.each { v ->
+                def sev = 'informational'
+                try { sev = (v.severity ?: v.severityWithCritical ?: v.level ?: 'informational').toString().toLowerCase() } catch(ignore) {}
+                switch(sev) {
+                  case 'critical': counts.Critica++; totals.Critica++; break
+                  case 'high':     counts.Alta++; totals.Alta++; break
+                  case 'medium':   counts.Media++; totals.Media++; break
+                  case 'low':      counts.Baja++; totals.Baja++; break
+                  default:        counts.Informativa++; totals.Informativa++; break
+                }
+              }
+
+              perFile << [file:path, total:vulns.size(), counts:counts]
+            } catch (err) {
+              echo "ERROR parsing ${path}: ${err}"
+              perFile << [file:path, error:err.toString()]
+            }
+          } // jsonFiles.each
+
+          def result = [generatedAt:new Date().toString(), totals:totals, files:perFile]
+          writeFile file: "${OUT_DIR}/vulnerability-summary.json", text: groovy.json.JsonOutput.prettyPrint(groovy.json.JsonOutput.toJson(result))
+
+          // Markdown readable - VERSIÓN CORREGIDA SIN StringBuilder
+          def mdLines = []
+          mdLines.add("# Resumen de vulnerabilidades (Snyk)")
+          mdLines.add("")
+          mdLines.add("Generado: ${result.generatedAt}")
+          mdLines.add("")
+          mdLines.add("## Totales")
+          mdLines.add("* Crítica: ${totals.Critica}")
+          mdLines.add("* Alta: ${totals.Alta}")
+          mdLines.add("* Media: ${totals.Media}")
+          mdLines.add("* Baja: ${totals.Baja}")
+          mdLines.add("* Informativa: ${totals.Informativa}")
+          mdLines.add("")
+          mdLines.add("## Por archivo")
+          perFile.each { pf ->
+            if (pf.error) {
+              mdLines.add("* ${pf.file} - ERROR: ${pf.error}")
+            } else {
+              mdLines.add("* ${pf.file} - total:${pf.total}, Critica:${pf.counts.Critica}, Alta:${pf.counts.Alta}, Media:${pf.counts.Media}, Baja:${pf.counts.Baja}, Info:${pf.counts.Informativa}")
+            }
+          }
+          
+          writeFile file: "${OUT_DIR}/vulnerability-summary.md", text: mdLines.join('\n')
+          echo "Resumen generado en ${OUT_DIR}/vulnerability-summary.*"
+        }
+      }
+    }
+
+    stage('Archive summary') {
+      steps {
+        archiveArtifacts artifacts: 'contador-output/**', fingerprint: true, allowEmptyArchive: false
+        sh "echo '--- Resumen (markdown) ---'; sed -n '1,200p' '${OUT_DIR}/vulnerability-summary.md' || true"
+      }
+    }
+  } // stages
+
+  post {
+    always { echo "ContadorVulnerabilidadesSynk terminado." }
+    success {
+      script {
+        if (params.FAIL_ON_CRITICAL.toBoolean()) {
+          def json = readFile("${OUT_DIR}/vulnerability-summary.json")
+          def parsed = new groovy.json.JsonSlurperClassic().parseText(json)
+          if (parsed.totals?.Critica > 0) {
+            error("Se detectaron ${parsed.totals.Critica} vulnerabilidades CRÍTICAS. FAIL_ON_CRITICAL=true -> marcando FAILURE.")
+          }
+        }
+      }
+    }
+  }
+}
