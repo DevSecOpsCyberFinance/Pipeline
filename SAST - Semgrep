@@ -15,7 +15,6 @@ pipeline {
   stages {
     stage('Prepare workspace (rsync without owner/perms)') {
       steps {
-        // interpolamos params.SRC y env.WORKSPACE desde Groovy (GString)
         sh """
           set -e
           rm -rf "${env.WORKSPACE}"/* || true
@@ -33,16 +32,13 @@ pipeline {
     stage('Semgrep (sequential)') {
       steps {
         script {
-          // tomar el parámetro SEMGREP_CONFIG (fallback a 'auto')
           def config = (params.SEMGREP_CONFIG ?: 'auto').trim()
           echo "SEMGREP_CONFIG seleccionado: '${config}'"
 
-          // obtener uid/gid del agente (números) para pasar a docker -u
           def uid = sh(script: 'id -u', returnStdout: true).trim()
           def gid = sh(script: 'id -g', returnStdout: true).trim()
           echo "Usando UID:GID = ${uid}:${gid} para docker run"
 
-          // parsear targets desde el parámetro ANALYZE_TARGETS
           def targets = (params.ANALYZE_TARGETS ?: '').tokenize(',').collect { it.trim() }.findAll { it }
           if (targets.isEmpty()) {
             echo "ANALYZE_TARGETS vacío — nothing to scan."
@@ -68,7 +64,6 @@ pipeline {
 
     stage('Summarize & conditional exit') {
       steps {
-        // usamos comillas simples triples para evitar que Groovy intente interpolar $f, $cnt, etc.
         sh '''
           set -euo pipefail
 
@@ -78,17 +73,14 @@ pipeline {
           for f in semgrep-*.json; do
             [ -f "$f" ] || continue
 
-            # contar 'results' con python (una sola línea)
             cnt=$(python3 -c "import json,sys; print(len(json.load(open(sys.argv[1])).get('results',[])))" "$f" 2>/dev/null || echo 0)
 
-            # sanitizar cnt
             case "$cnt" in ''|*[!0-9]*) cnt=0 ;; esac
 
             echo "$f=$cnt" >> semgrep-report-summary.txt
             total=$(( total + cnt ))
           done
 
-          # asegurar que exista el resumen
           if [ ! -f semgrep-report-summary.txt ]; then
             echo "total_findings=0" > semgrep-report-summary.txt
           else
@@ -97,7 +89,6 @@ pipeline {
 
           cat semgrep-report-summary.txt
 
-          # decidir exit según FAIL_ON_FINDINGS (parametro exportado por Jenkins)
           if [ "${FAIL_ON_FINDINGS:-false}" = "true" ] && [ "${total:-0}" -gt 0 ]; then
             echo "FAIL_ON_FINDINGS=true y total>0 -> saliendo con código 1"
             exit 1
