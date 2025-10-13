@@ -1,0 +1,274 @@
+pipeline {
+  agent any
+
+  parameters {
+    string(name: 'PROJECT_PATH', defaultValue: '/projects/Cyberfinance-Bank-main', description: 'Ruta del proyecto a pasar a SAST/SCA.')
+    booleanParam(name: 'BYPASS_ON_CRITICAL', defaultValue: false, description: 'Si true -> ignora detecciones criticas y permite continuar el deploy.')
+    string(name: 'SNYK_CREDENTIAL_ID', defaultValue: 'Synk-DevSecOps-cli', description: 'Credential ID para Snyk (Secret text).')
+    string(name: 'SNYK_TOOL_NAME', defaultValue: 'Snyk', description: 'Nombre de la instalación Snyk en Jenkins (si aplica).')
+    // para DAST
+    string(name: 'FRONTEND_URL', defaultValue: 'http://127.0.0.1:3000/', description: 'URL que ZAP debe escanear (desde el agente).')
+    string(name: 'ZAP_IMAGE', defaultValue: 'zaproxy/zap-stable:latest', description: 'Imagen docker de ZAP')
+    string(name: 'ZAP_SCAN_MINUTES', defaultValue: '10', description: 'Timeout en minutos para ZAP')
+  }
+
+  environment {
+    SAST_JOB = 'Ingredientes/SAST - Semgrep'
+    SCA_JOB  = 'Ingredientes/SCA - Snyk'
+    CONTADOR_JOB = 'Ingredientes/ContadorVulnerabilidadesSynk'
+    DAST_JOB = 'Ingredientes/DAST - ZAP'
+
+    SAST_ARTIFACTS = "${env.WORKSPACE}/sast-artifacts"
+    SNYK_ARTIFACTS = "${env.WORKSPACE}/snyk-artifacts"
+    CONTADOR_ARTIFACTS = "${env.WORKSPACE}/contador-artifacts"
+    ZAP_ARTIFACTS = "${env.WORKSPACE}/zap-artifacts"
+  }
+
+  options {
+    // tiempo global opcional
+    timeout(time: 120, unit: 'MINUTES')
+    ansiColor('xterm')
+  }
+
+  stages {
+
+    stage('Cleanup workspace') {
+      steps {
+        sh """
+          rm -rf "${env.WORKSPACE}/sast-artifacts" "${env.WORKSPACE}/snyk-artifacts" "${env.WORKSPACE}/contador-artifacts" "${env.WORKSPACE}/zap-artifacts" || true
+          mkdir -p "${SAST_ARTIFACTS}" "${SNYK_ARTIFACTS}" "${CONTADOR_ARTIFACTS}" "${ZAP_ARTIFACTS}"
+        """
+      }
+    }
+
+    stage('Trigger SAST - Semgrep') {
+      steps {
+        script {
+          echo "Lanzando job SAST: ${env.SAST_JOB} (SRC=${params.PROJECT_PATH})"
+          def sastBuild = build job: env.SAST_JOB,
+            parameters: [
+              [$class: 'BooleanParameterValue', name: 'FAIL_ON_FINDINGS', value: false],
+              [$class: 'StringParameterValue', name: 'SEMGREP_CONFIG', value: 'auto'],
+              [$class: 'StringParameterValue', name: 'SRC', value: params.PROJECT_PATH],
+              [$class: 'StringParameterValue', name: 'ANALYZE_TARGETS', value: 'Backend,Frontend']
+            ],
+            wait: true, propagate: false
+
+          echo "SAST build number: ${sastBuild?.number}  result: ${sastBuild?.result}"
+
+          try {
+            echo "Copiando artifacts de ${env.SAST_JOB}#${sastBuild.number} -> ${SAST_ARTIFACTS}"
+            step ([$class: 'CopyArtifact',
+                   projectName: env.SAST_JOB,
+                   filter: '**/semgrep-*.json, **/semgrep-report-summary.txt',
+                   target: 'sast-artifacts',
+                   flatten: false,
+                   optional: true,
+                   selector: [$class: 'SpecificBuildSelector', buildNumber: "${sastBuild.number}"]
+            ])
+            sh "ls -la '${SAST_ARTIFACTS}' || true"
+          } catch (err) {
+            echo "WARNING: no se pudieron copiar artifacts de SAST: ${err}"
+          }
+
+          // Leer summary para decidir política
+          def totalFindings = 0
+          def summaryFile = "${SAST_ARTIFACTS}/semgrep-report-summary.txt"
+          if (fileExists(summaryFile)) {
+            def txt = readFile(summaryFile).trim()
+            echo "Contenido semgrep summary:\n${txt}"
+            def m = txt =~ /total_findings=(\d+)/
+            if (m) {
+              totalFindings = m[0][1].toInteger()
+            } else {
+              def sum = 0
+              txt.split('\\n').each { line ->
+                def mm = line =~ /=\\s*(\\d+)$/
+                if (mm) { sum += mm[0][1].toInteger() }
+              }
+              totalFindings = sum
+            }
+          } else {
+            echo "Aviso: no existe ${summaryFile} — asumiendo 0 findings."
+          }
+
+          echo "Total semgrep findings detectados: ${totalFindings}"
+
+          if (totalFindings > 0 && !params.BYPASS_ON_CRITICAL) {
+            echo "Encontrados ${totalFindings} findings y BYPASS_ON_CRITICAL=false -> marcando build como UNSTABLE y abortando despliegue."
+            currentBuild.result = 'UNSTABLE'
+            error("Deteniendo pipeline por findings en SAST (usar BYPASS_ON_CRITICAL=true para ignorar).")
+          } else if (totalFindings > 0 && params.BYPASS_ON_CRITICAL) {
+            echo "Encontrados ${totalFindings} findings pero BYPASS_ON_CRITICAL=true -> continuando."
+          } else {
+            echo "No se detectaron findings críticos -> continuando."
+          }
+        }
+      }
+    }
+
+    stage('Trigger SCA - Snyk') {
+      steps {
+        script {
+          echo "Lanzando job SCA: ${env.SCA_JOB} (TARGET=${params.PROJECT_PATH}/Frontend/) ${params.PROJECT_PATH}/Backend/"
+          def snykBuild = build job: env.SCA_JOB,
+            parameters: [
+              [$class: 'StringParameterValue', name: 'TARGET_PATHS', value: "${params.PROJECT_PATH}/Frontend/,${params.PROJECT_PATH}/Backend/"],
+              [$class: 'StringParameterValue', name: 'SNYK_CREDENTIAL_ID', value: params.SNYK_CREDENTIAL_ID],
+              [$class: 'StringParameterValue', name: 'SNYK_TOOL_NAME', value: params.SNYK_TOOL_NAME],
+              [$class: 'BooleanParameterValue', name: 'FAIL_PIPE_ON_CRITICAL', value: false]
+            ],
+            wait: true, propagate: false
+
+          echo "Snyk build number: ${snykBuild?.number}  result: ${snykBuild?.result}"
+
+          try {
+            echo "Copiando artifacts de ${env.SCA_JOB}#${snykBuild.number} -> ${SNYK_ARTIFACTS}"
+            step ([$class: 'CopyArtifact',
+                   projectName: env.SCA_JOB,
+                   filter: 'snyk-reports/**',
+                   target: 'snyk-artifacts',
+                   flatten: false,
+                   optional: true,
+                   selector: [$class: 'SpecificBuildSelector', buildNumber: "${snykBuild.number}"]
+            ])
+            sh "ls -la '${SNYK_ARTIFACTS}' || true"
+          } catch (err2) {
+            echo "WARNING: no se pudieron copiar artifacts de Snyk: ${err2}"
+          }
+        }
+      }
+    }
+
+    stage('Trigger ContadorVulnerabilidadesSynk') {
+      steps {
+        script {
+          echo "Lanzando job ContadorVulnerabilidadesSynk: ${env.CONTADOR_JOB}"
+          def contBuild = build job: env.CONTADOR_JOB,
+            parameters: [],
+            wait: true, propagate: false
+
+          echo "Contador build number: ${contBuild?.number}  result: ${contBuild?.result}"
+
+          try {
+            echo "Copiando artifacts de ${env.CONTADOR_JOB}#${contBuild.number} -> ${CONTADOR_ARTIFACTS}"
+            step ([$class: 'CopyArtifact',
+                   projectName: env.CONTADOR_JOB,
+                   filter: '**/*',
+                   target: 'contador-artifacts',
+                   flatten: false,
+                   optional: true,
+                   selector: [$class: 'SpecificBuildSelector', buildNumber: "${contBuild.number}"]
+            ])
+            sh "ls -la '${CONTADOR_ARTIFACTS}' || true"
+          } catch (err3) {
+            echo "WARNING: no se pudieron copiar artifacts del contador: ${err3}"
+          }
+        }
+      }
+    }
+
+    stage('Deploy app (docker compose up - safe)') {
+      when {
+        expression { return !(currentBuild.result == 'UNSTABLE' || currentBuild.result == 'FAILURE') }
+      }
+      steps {
+        script {
+          echo "Desplegando aplicación en ${params.PROJECT_PATH} con estrategia idempotente (sin health-check)"
+
+          sh '''
+            set -euo pipefail
+            T="${PROJECT_PATH}"
+            if [ ! -d "$T" ]; then
+              echo "ERROR: ruta $T no existe"
+              exit 2
+            fi
+            cd "$T"
+
+            echo "1) Validando docker compose config..."
+            docker compose config > /dev/null || echo "Warning: docker compose config falló (verificar archivo), pero intento continuar."
+
+            echo "2) Intentando pull de imágenes (no fatal)..."
+            docker compose pull || echo "Aviso: docker compose pull falló, continuamos con las imágenes locales"
+
+            echo "3) Levantando (up -d --remove-orphans)"
+            docker compose up -d --remove-orphans
+
+            echo "4) Estado de containers:"
+            docker compose ps
+
+            echo "Logs recientes (tail 100 por servicio):"
+            docker compose logs --tail=100 || true
+          '''
+        }
+      }
+      post {
+        success { echo "Deploy: docker compose terminó OK." }
+        failure { echo "Deploy: hubo errores, revisar logs y estado de containers." }
+      }
+    }
+
+    stage('Trigger DAST - ZAP (no-fail)') {
+      steps {
+        script {
+          echo "Lanzando job DAST: ${env.DAST_JOB} (FRONTEND_URL=${params.FRONTEND_URL})"
+
+          def dastBuild = build job: env.DAST_JOB,
+            parameters: [
+              [$class: 'StringParameterValue', name: 'FRONTEND_URL', value: params.FRONTEND_URL],
+              [$class: 'StringParameterValue', name: 'ZAP_IMAGE', value: params.ZAP_IMAGE],
+              [$class: 'StringParameterValue', name: 'SCAN_MAX_MINUTES', value: params.ZAP_SCAN_MINUTES],
+              [$class: 'BooleanParameterValue', name: 'FAIL_ON_HIGH', value: false],
+              [$class: 'BooleanParameterValue', name: 'USE_NETWORK_HOST', value: true]
+            ],
+            wait: true, propagate: false
+
+          echo "DAST build number: ${dastBuild?.number}  result: ${dastBuild?.result}"
+
+          try {
+            echo "Copiando artifacts de ${env.DAST_JOB}#${dastBuild.number} -> ${ZAP_ARTIFACTS}"
+            step ([$class: 'CopyArtifact',
+                   projectName: env.DAST_JOB,
+                   filter: 'zap-reports/**',
+                   target: 'zap-artifacts',
+                   flatten: false,
+                   optional: true,
+                   selector: [$class: 'SpecificBuildSelector', buildNumber: "${dastBuild.number}"]
+            ])
+            sh "ls -la '${ZAP_ARTIFACTS}' || true"
+          } catch (err4) {
+            echo "WARNING: no se pudieron copiar artifacts de DAST: ${err4}"
+          }
+
+          echo "DAST completado (no-fail). Resultado del job DAST: ${dastBuild?.result}"
+        }
+      }
+    }
+
+    stage('Archive collected artifacts') {
+      steps {
+        script {
+          sh """
+            echo "=== SAST artifacts ==="
+            ls -la "${SAST_ARTIFACTS}" || true
+            echo "=== SNYK artifacts ==="
+            ls -la "${SNYK_ARTIFACTS}" || true
+            echo "=== CONTADOR artifacts ==="
+            ls -la "${CONTADOR_ARTIFACTS}" || true
+            echo "=== ZAP artifacts ==="
+            ls -la "${ZAP_ARTIFACTS}" || true
+          """
+        }
+        archiveArtifacts artifacts: 'sast-artifacts/**, snyk-artifacts/**, contador-artifacts/**, zap-artifacts/**', fingerprint: true, allowEmptyArchive: true
+      }
+    }
+
+  } // end stages
+
+  post {
+    success { echo "Deploy Seguro: COMPLETADO con éxito." }
+    unstable { echo "Deploy Seguro: terminó UNSTABLE (revisar findings)." }
+    failure { echo "Deploy Seguro: FALLÓ." }
+    always { echo "Workspace: ${env.WORKSPACE}" }
+  }
+}
