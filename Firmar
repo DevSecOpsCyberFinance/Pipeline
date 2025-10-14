@@ -1,0 +1,198 @@
+pipeline {
+  agent any
+
+  parameters {
+    string(name: 'IMAGE_DIGESTS_CSV', defaultValue: '', description: 'CSV de image@sha256:... o vacío para usar image-digest-*.txt')
+    string(name: 'COSIGN_KEY_CREDENTIAL_ID', defaultValue: 'cosign-private-key', description: 'ID de credencial con la clave privada')
+    string(name: 'COSIGN_PUB_KEY_CREDENTIAL_ID', defaultValue: 'cosign-public-key', description: 'ID de credencial con la clave pública')
+  }
+
+  environment {
+    WORKSPACE_DIR = "${env.WORKSPACE}"
+    COSIGN_PASSWORD = ""  
+  }
+
+  options {
+    ansiColor('xterm')
+    timeout(time: 30, unit: 'MINUTES')
+  }
+
+  stages {
+
+    stage('Copiar artifacts del build anterior') {
+      steps {
+        copyArtifacts(
+          projectName: 'Ingredientes/Firmador/Build-and-Push-Image',
+          selector: lastSuccessful(),
+          filter: 'image-*.txt,push-*.log',
+          target: '.',
+          flatten: true
+        )
+      }
+    }
+
+    stage('Preparar lista de imágenes para firmar') {
+      steps {
+        script {
+          sh '''
+            set -euo pipefail
+            
+            echo "=== Preparando lista de imágenes para firmar ==="
+            
+            # Crear archivo temporal con formato correcto
+            rm -f images-to-sign-final.txt
+            touch images-to-sign-final.txt
+            
+            # Procesar backend
+            if [ -f "image-digest-backend.txt" ] && [ -s "image-digest-backend.txt" ]; then
+              BACK_DIGEST=$(cat image-digest-backend.txt | tr -d '\\r\\n' | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
+              BACK_REF=$(cat image-ref-backend.txt | tr -d '\\r\\n' | sed 's/^[[:space:]]*//;s/[[:space:]]*$//' | sed -E 's|:[^/]*$||')
+              
+              if [ -n "$BACK_DIGEST" ] && [ "$BACK_DIGEST" != "sha256:" ]; then
+                BACK_FULL="${BACK_REF}@${BACK_DIGEST}"
+                echo "$BACK_FULL" >> images-to-sign-final.txt
+                echo "Backend image: $BACK_FULL"
+              fi
+            fi
+            
+            # Procesar frontend
+            if [ -f "image-digest-frontend.txt" ] && [ -s "image-digest-frontend.txt" ]; then
+              FRONT_DIGEST=$(cat image-digest-frontend.txt | tr -d '\\r\\n' | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
+              FRONT_REF=$(cat image-ref-frontend.txt | tr -d '\\r\\n' | sed 's/^[[:space:]]*//;s/[[:space:]]*$//' | sed -E 's|:[^/]*$||')
+              
+              if [ -n "$FRONT_DIGEST" ] && [ "$FRONT_DIGEST" != "sha256:" ]; then
+                FRONT_FULL="${FRONT_REF}@${FRONT_DIGEST}"
+                echo "$FRONT_FULL" >> images-to-sign-final.txt
+                echo "Frontend image: $FRONT_FULL"
+              fi
+            fi
+            
+            # Verificar que tenemos imágenes para firmar
+            if [ ! -s "images-to-sign-final.txt" ]; then
+              echo "ERROR: No se encontraron imágenes para firmar"
+              exit 1
+            fi
+            
+            echo "=== Lista final de imágenes para firmar ==="
+            cat images-to-sign-final.txt
+          '''
+        }
+      }
+    }
+
+    stage('Firmar imágenes con Cosign') {
+      steps {
+        script {
+          withCredentials([
+            file(credentialsId: params.COSIGN_KEY_CREDENTIAL_ID, variable: 'COSIGN_PRIVATE_KEY'),
+            file(credentialsId: params.COSIGN_PUB_KEY_CREDENTIAL_ID, variable: 'COSIGN_PUBLIC_KEY')
+          ]) {
+            sh '''
+              set -euo pipefail
+              export COSIGN_PASSWORD=""
+              
+              echo "=== Iniciando proceso de firma ==="
+              echo "Clave privada: $COSIGN_PRIVATE_KEY"
+              echo "Clave pública: $COSIGN_PUBLIC_KEY"
+              echo "COSIGN_PASSWORD: ${COSIGN_PASSWORD}"
+              
+              # Contador para tracking
+              TOTAL_IMAGES=$(wc -l < images-to-sign-final.txt)
+              CURRENT=1
+              
+              while read -r IMAGE; do
+                echo ""
+                echo "--- Procesando imagen $CURRENT de $TOTAL_IMAGES ---"
+                echo "Firmando: $IMAGE"
+                
+                # Firmar la imagen
+                if cosign sign --yes --allow-insecure-registry --key "$COSIGN_PRIVATE_KEY" "$IMAGE" 2>&1 | tee "cosign-sign-${CURRENT}.log"; then
+                  echo "✅ Firma exitosa para: $IMAGE"
+                  
+                  # Verificar la firma
+                  if cosign verify --allow-insecure-registry --key "$COSIGN_PUBLIC_KEY" "$IMAGE" 2>&1 | tee "cosign-verify-${CURRENT}.log"; then
+                    echo "✅ Verificación exitosa para: $IMAGE"
+                  else
+                    echo "❌ Verificación FALLÓ para: $IMAGE"
+                    echo "Continuando con siguiente imagen..."
+                  fi
+                  
+                else
+                  echo "❌ Firma FALLÓ para: $IMAGE"
+                  echo "Continuando con siguiente imagen..."
+                fi
+                
+                CURRENT=$((CURRENT + 1))
+                echo "--- Fin de imagen $((CURRENT-1)) ---"
+                echo ""
+                
+              done < images-to-sign-final.txt
+              
+              echo "=== Proceso de firma completado ==="
+            '''
+          }
+        }
+      }
+      post {
+        always {
+          archiveArtifacts artifacts: 'cosign-*.log,images-to-sign-final.txt', fingerprint: true, allowEmptyArchive: true
+        }
+      }
+    }
+
+    stage('Verificación final y reporte') {
+      steps {
+        script {
+          sh '''
+            set -euo pipefail
+            
+            echo "=== Reporte Final de Firmas ==="
+            echo ""
+            
+            # Verificar logs de firma
+            echo "📋 Logs de firma generados:"
+            ls -la cosign-*.log || echo "No se encontraron logs"
+            
+            echo ""
+            echo "🔍 Resumen de firmas:"
+            
+            if [ -f "images-to-sign-final.txt" ]; then
+              echo "Imágenes que debieron firmarse:"
+              cat images-to-sign-final.txt
+            fi
+            
+            echo ""
+            echo "✅ Proceso completado - Revisar logs para detalles específicos"
+          '''
+        }
+      }
+      post {
+        always {
+          archiveArtifacts artifacts: 'image-*.txt,images-to-sign-final.txt,cosign-*.log', fingerprint: true, allowEmptyArchive: true
+        }
+      }
+    }
+
+  } 
+
+  post {
+    success {
+      echo "🎉 FIRMAR-IMAGENES: COMPLETADO EXITOSAMENTE"
+      sh '''
+        echo "Todas las imágenes fueron procesadas"
+        echo "Revisa los artifacts para ver logs detallados"
+      '''
+    }
+    failure {
+      echo "❌ FIRMAR-IMAGENES: FALLÓ"
+    }
+    always {
+      sh '''
+        echo "=== Limpieza final ==="
+        ls -la
+        echo "Workspace size:"
+        du -sh . || true
+      '''
+    }
+  }
+}
