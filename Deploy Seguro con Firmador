@@ -1,0 +1,174 @@
+pipeline {
+  agent any
+
+  parameters {
+    string(name: 'PROJECT_PATH', defaultValue: '/projects/Cyberfinance-Bank-main', description: 'Ruta del proyecto a pasar a SAST/SCA.')
+    booleanParam(name: 'BYPASS_ON_CRITICAL', defaultValue: false, description: 'Si true -> ignora detecciones criticas y permite continuar el deploy.')
+    string(name: 'SNYK_CREDENTIAL_ID', defaultValue: 'Synk-DevSecOps-cli', description: 'Credential ID para Snyk (Secret text).')
+    string(name: 'SNYK_TOOL_NAME', defaultValue: 'Snyk', description: 'Nombre de la instalación Snyk en Jenkins (si aplica).')
+    string(name: 'FRONTEND_URL', defaultValue: 'http://127.0.0.1:3000/', description: 'URL que ZAP debe escanear (desde el agente).')
+    string(name: 'ZAP_IMAGE', defaultValue: 'zaproxy/zap-stable:latest', description: 'Imagen docker de ZAP')
+    string(name: 'ZAP_SCAN_MINUTES', defaultValue: '10', description: 'Timeout en minutos para ZAP')
+  }
+
+  environment {
+    SAST_JOB = 'Ingredientes/SAST - Semgrep'
+    SCA_JOB  = 'Ingredientes/SCA - Snyk'
+    CONTADOR_JOB = 'Ingredientes/ContadorVulnerabilidadesSynk'
+    DAST_JOB = 'Ingredientes/DAST - ZAP'
+
+    SAST_ARTIFACTS = "${env.WORKSPACE}/sast-artifacts"
+    SNYK_ARTIFACTS = "${env.WORKSPACE}/snyk-artifacts"
+    CONTADOR_ARTIFACTS = "${env.WORKSPACE}/contador-artifacts"
+    ZAP_ARTIFACTS = "${env.WORKSPACE}/zap-artifacts"
+  }
+
+  options {
+    timeout(time: 120, unit: 'MINUTES')
+    ansiColor('xterm')
+  }
+
+
+
+  stages {
+
+    stage('Cleanup workspace') {
+      steps {
+        sh """
+          rm -rf "${SAST_ARTIFACTS}" "${SNYK_ARTIFACTS}" "${CONTADOR_ARTIFACTS}" "${ZAP_ARTIFACTS}" firmador-artifacts || true
+          mkdir -p "${SAST_ARTIFACTS}" "${SNYK_ARTIFACTS}" "${CONTADOR_ARTIFACTS}" "${ZAP_ARTIFACTS}" firmador-artifacts
+        """
+      }
+    }
+
+    // 🔹 SAST
+    stage('Trigger SAST - Semgrep') {
+      steps {
+        script {
+          echo "Lanzando job SAST: ${env.SAST_JOB} (SRC=${params.PROJECT_PATH})"
+          def sastBuild = build job: env.SAST_JOB,
+            parameters: [
+              [$class: 'BooleanParameterValue', name: 'FAIL_ON_FINDINGS', value: false],
+              [$class: 'StringParameterValue', name: 'SEMGREP_CONFIG', value: 'auto'],
+              [$class: 'StringParameterValue', name: 'SRC', value: params.PROJECT_PATH],
+              [$class: 'StringParameterValue', name: 'ANALYZE_TARGETS', value: 'Backend,Frontend']
+            ],
+            wait: true, propagate: false
+
+          echo "SAST build number: ${sastBuild?.number} result: ${sastBuild?.result}"
+        }
+      }
+    }
+
+    // 🔹 SCA
+    stage('Trigger SCA - Snyk') {
+      steps {
+        script {
+          echo "Lanzando job SCA: ${env.SCA_JOB}"
+          def snykBuild = build job: env.SCA_JOB,
+            parameters: [
+              [$class: 'StringParameterValue', name: 'TARGET_PATHS', value: "${params.PROJECT_PATH}/Frontend/,${params.PROJECT_PATH}/Backend/"],
+              [$class: 'StringParameterValue', name: 'SNYK_CREDENTIAL_ID', value: params.SNYK_CREDENTIAL_ID],
+              [$class: 'StringParameterValue', name: 'SNYK_TOOL_NAME', value: params.SNYK_TOOL_NAME]
+            ],
+            wait: true, propagate: false
+        }
+      }
+    }
+
+    // 🔹 CONTADOR
+    stage('Trigger ContadorVulnerabilidadesSynk') {
+      steps {
+        script {
+          echo "Lanzando job Contador: ${env.CONTADOR_JOB}"
+          def contBuild = build job: env.CONTADOR_JOB, wait: true, propagate: false
+          echo "Contador build result: ${contBuild?.result}"
+        }
+      }
+    }
+
+    // 🔹 BUILD
+    stage('Build & Push (Firmador)') {
+      steps {
+        script {
+          def build = build job: 'Ingredientes/Firmador/Build-and-Push-Image',
+            parameters: [
+              [$class: 'StringParameterValue', name: 'PROJECT_PATH', value: params.PROJECT_PATH],
+              [$class: 'StringParameterValue', name: 'IMAGE_REPO_BASE', value: 'devsecops/cyberfinance/cyberfinance-bank'],
+              [$class: 'StringParameterValue', name: 'TAG', value: "ci-${env.BUILD_NUMBER}"],
+              [$class: 'StringParameterValue', name: 'REGISTRY_CREDENTIAL_ID', value: 'devsecops-registry-cred']
+            ],
+            wait: true, propagate: true
+
+          echo "Build job result: ${build?.result} #${build?.number}"
+        }
+      }
+    }
+
+    // 🔹 FIRMA
+    stage('Firmar y Atestar (Firmador)') {
+      steps {
+        script {
+          def sign = build job: 'Ingredientes/Firmador/Firmar',
+            parameters: [
+              [$class: 'StringParameterValue', name: 'REGISTRY_CREDENTIAL_ID', value: 'devsecops-registry-cred'],
+              [$class: 'StringParameterValue', name: 'COSIGN_KEY_CREDENTIAL_ID', value: 'cosign-private-key'],
+              [$class: 'StringParameterValue', name: 'COSIGN_KEY_PASS_ID', value: 'cosign-key-passphrase']
+            ],
+            wait: true, propagate: true
+
+          echo "Firmar job result: ${sign?.result} #${sign?.number}"
+
+          signBuildNumber = sign?.number?.toString() ?: ""
+          if (!signBuildNumber) {
+            error("No se pudo obtener el número de build del job de firma.")
+          }
+        }
+      }
+    }
+
+    // 🔹 DEPLOY
+    stage('Desplegar y verificar (Firmador)') {
+      steps {
+        script {
+          echo "Usando build de firma N° ${signBuildNumber}"
+          def deploy = build job: 'Ingredientes/Firmador/Desplegar-Imagen',
+            parameters: [
+              [$class: 'StringParameterValue', name: 'PROJECT_PATH', value: params.PROJECT_PATH],
+              [$class: 'StringParameterValue', name: 'FIRMAR_JOB_BUILD_NUMBER', value: signBuildNumber],
+              [$class: 'StringParameterValue', name: 'COSIGN_PUB_KEY_CREDENTIAL_ID', value: 'cosign-public-key']
+            ],
+            wait: true, propagate: true
+
+          echo "Deploy job result: ${deploy?.result} #${deploy?.number}"
+        }
+      }
+    }
+
+    // 🔹 DAST
+    stage('Trigger DAST - ZAP (no-fail)') {
+      steps {
+        script {
+          def dastBuild = build job: env.DAST_JOB,
+            parameters: [
+              [$class: 'StringParameterValue', name: 'FRONTEND_URL', value: params.FRONTEND_URL],
+              [$class: 'StringParameterValue', name: 'ZAP_IMAGE', value: params.ZAP_IMAGE],
+              [$class: 'StringParameterValue', name: 'SCAN_MAX_MINUTES', value: params.ZAP_SCAN_MINUTES],
+              [$class: 'BooleanParameterValue', name: 'FAIL_ON_HIGH', value: false],
+              [$class: 'BooleanParameterValue', name: 'USE_NETWORK_HOST', value: true]
+            ],
+            wait: true, propagate: false
+
+          echo "DAST build number: ${dastBuild?.number} result: ${dastBuild?.result}"
+        }
+      }
+    }
+  }
+
+  post {
+    success { echo "Deploy Seguro: COMPLETADO con éxito ✅" }
+    unstable { echo "Deploy Seguro: terminó UNSTABLE ⚠️" }
+    failure { echo "Deploy Seguro: FALLÓ ❌" }
+    always { echo "Workspace: ${env.WORKSPACE}" }
+  }
+}
