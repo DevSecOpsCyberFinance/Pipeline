@@ -1,0 +1,245 @@
+// Jenkinsfile - Build-and-Push-Image (rsync -> build -> push -> digests)
+pipeline {
+  agent any
+
+  parameters {
+    string(name: 'PROJECT_PATH', defaultValue: '/projects/Cyberfinance-Bank-main', description: 'Ruta del proyecto en el nodo (se copiará al workspace con rsync).')
+    string(name: 'IMAGE_REPO_BASE', defaultValue: 'localhost:5000/cyberfinance/cyberfinance-bank', description: 'Repo base (sin sufijo -backend/-frontend). Ej: localhost:5000/cyberfinance/cyberfinance-bank')
+    string(name: 'TAG', defaultValue: '', description: 'Tag a usar (si vacío se usará ci-<BUILD_NUMBER>)')
+    string(name: 'REGISTRY_HOST', defaultValue: 'localhost:5000', description: 'Host del registry (ej. localhost:5000). No se realiza login en este Jenkinsfile.')
+  }
+
+  options {
+    ansiColor('xterm')
+    timeout(time: 60, unit: 'MINUTES')
+  }
+
+  environment {
+    WORKDIR = "${env.WORKSPACE}"
+    SRC_COPY = "${env.WORKSPACE}/src"
+  }
+
+  stages {
+
+    stage('Preparar (calcular variables)') {
+      steps {
+        script {
+          def tag = params.TAG?.trim() ? params.TAG.trim() : "ci-${env.BUILD_NUMBER}"
+          def backendImage = "${params.IMAGE_REPO_BASE}-backend:${tag}"
+          def frontendImage = "${params.IMAGE_REPO_BASE}-frontend:${tag}"
+
+          // export para usar más abajo
+          env.TAG = tag
+          env.BACKEND_IMAGE = backendImage
+          env.FRONTEND_IMAGE = frontendImage
+          env.REGISTRY_HOST = params.REGISTRY_HOST?.trim() ?: "localhost:5000"
+
+          echo "Tag: ${env.TAG}"
+          echo "BackendImage: ${env.BACKEND_IMAGE}"
+          echo "FrontendImage: ${env.FRONTEND_IMAGE}"
+          echo "RegistryHost: ${env.REGISTRY_HOST}"
+
+          sh "mkdir -p '${env.SRC_COPY}' '${env.WORKDIR}/images' || true"
+        }
+      }
+    }
+
+    stage('Sync project to workspace (rsync)') {
+      steps {
+        script {
+          // Copiamos todo el proyecto al workspace para evitar dependencias de rutas host
+          // exclude opcionales: node_modules, .git, target, etc.
+          sh '''
+            set -euo pipefail
+            echo "Sincronizando ${PROJECT_PATH} -> ${WORKSPACE}/src (rsync)"
+            rm -rf "${WORKSPACE}/src" || true
+            mkdir -p "${WORKSPACE}/src"
+            rsync -a --delete \
+              --exclude='.git' \
+              --exclude='node_modules' \
+              --exclude='target' \
+              --exclude='**/node_modules' \
+              "${PROJECT_PATH}/" "${WORKSPACE}/src/" || true
+            echo "Contenido del src (primeros 200 líneas):"
+            ls -la "${WORKSPACE}/src" | sed -n '1,200p' || true
+          '''
+        }
+      }
+    }
+
+    stage('Build Backend') {
+      steps {
+        script {
+          def backendDir = "${env.WORKSPACE}/src/Backend"
+          def backendImage = env.BACKEND_IMAGE
+          sh """
+            set -euo pipefail
+            echo "Build backend: dir=${backendDir} -> image=${backendImage}"
+            if [ -d "${backendDir}" ]; then
+              cd "${backendDir}"
+              docker build -t "${backendImage}" .
+            else
+              echo "Aviso: no existe ${backendDir} — saltando build backend"
+            fi
+          """
+        }
+      }
+    }
+
+    stage('Build Frontend') {
+      steps {
+        script {
+          def frontendDir = "${env.WORKSPACE}/src/Frontend"
+          def frontendImage = env.FRONTEND_IMAGE
+          sh """
+            set -euo pipefail
+            echo "Build frontend: dir=${frontendDir} -> image=${frontendImage}"
+            if [ -d "${frontendDir}" ]; then
+              cd "${frontendDir}"
+              docker build -t "${frontendImage}" .
+            else
+              echo "Aviso: no existe ${frontendDir} — saltando build frontend"
+            fi
+          """
+        }
+      }
+    }
+
+    stage('Push images & obtener digests') {
+      steps {
+        script {
+          // Genero un script con placeholders (para evitar problemas de $/${} en Groovy)
+          writeFile file: 'do_push.sh', text: '''#!/bin/bash
+set -euo pipefail
+echo "START PUSH SCRIPT"
+
+# BACKEND
+echo "=== Pushing backend: __BACKEND_IMAGE__ ==="
+if docker image inspect "__BACKEND_IMAGE__" >/dev/null 2>&1; then
+  docker push "__BACKEND_IMAGE__" 2>&1 | tee push-backend.log || true
+  BACK_DIGEST=$(grep -oE 'sha256:[0-9a-f]{64}' push-backend.log | head -n1 || true)
+  if [ -z "${BACK_DIGEST}" ]; then
+    tmp=$(docker inspect --format='{{index .RepoDigests 0}}' "__BACKEND_IMAGE__" 2>/dev/null || true)
+    if [ -n "${tmp}" ]; then
+      BACK_DIGEST=$(echo "${tmp}" | sed -E 's/.*@//')
+    fi
+  fi
+  echo "BACK_DIGEST=${BACK_DIGEST}"
+  printf '%s' "__BACKEND_IMAGE__" > image-ref-backend.txt || true
+  printf '%s' "${BACK_DIGEST}" > image-digest-backend.txt || true
+else
+  echo "No backend image local found for __BACKEND_IMAGE__ - skipping push"
+  echo "" > image-digest-backend.txt || true
+  printf '%s' "__BACKEND_IMAGE__" > image-ref-backend.txt || true
+fi
+
+# FRONTEND
+echo "=== Pushing frontend: __FRONTEND_IMAGE__ ==="
+if docker image inspect "__FRONTEND_IMAGE__" >/dev/null 2>&1; then
+  docker push "__FRONTEND_IMAGE__" 2>&1 | tee push-frontend.log || true
+  FRONT_DIGEST=$(grep -oE 'sha256:[0-9a-f]{64}' push-frontend.log | head -n1 || true)
+  if [ -z "${FRONT_DIGEST}" ]; then
+    tmpf=$(docker inspect --format='{{index .RepoDigests 0}}' "__FRONTEND_IMAGE__" 2>/dev/null || true)
+    if [ -n "${tmpf}" ]; then
+      FRONT_DIGEST=$(echo "${tmpf}" | sed -E 's/.*@//')
+    fi
+  fi
+  echo "FRONT_DIGEST=${FRONT_DIGEST}"
+  printf '%s' "__FRONTEND_IMAGE__" > image-ref-frontend.txt || true
+  printf '%s' "${FRONT_DIGEST}" > image-digest-frontend.txt || true
+else
+  echo "No frontend image local found for __FRONTEND_IMAGE__ - skipping push"
+  echo "" > image-digest-frontend.txt || true
+  printf '%s' "__FRONTEND_IMAGE__" > image-ref-frontend.txt || true
+fi
+
+echo "=== Summary ==="
+echo "backend image: __BACKEND_IMAGE__"
+echo "frontend image: __FRONTEND_IMAGE__"
+echo "image-ref-backend.txt content:"; cat image-ref-backend.txt || true
+echo "image-digest-backend.txt content:"; cat image-digest-backend.txt || true
+echo "image-ref-frontend.txt content:"; cat image-ref-frontend.txt || true
+echo "image-digest-frontend.txt content:"; cat image-digest-frontend.txt || true
+ls -la || true
+'''
+
+          // reemplazo placeholders por los valores reales (safe con sed usando delimitador |)
+          sh """
+            chmod +x do_push.sh
+            sed -i 's|__BACKEND_IMAGE__|${env.BACKEND_IMAGE}|g' do_push.sh
+            sed -i 's|__FRONTEND_IMAGE__|${env.FRONTEND_IMAGE}|g' do_push.sh
+            ./do_push.sh
+          """
+        }
+      }
+      post {
+        always {
+          archiveArtifacts artifacts: 'push-*.log,image-ref-*.txt,image-digest-*.txt', fingerprint: true, allowEmptyArchive: true
+        }
+      }
+    }
+
+    stage('Leer digests y validar') {
+      steps {
+        script {
+          def backDigest = ''
+          def frontDigest = ''
+
+          if (fileExists('image-digest-backend.txt')) {
+            backDigest = readFile('image-digest-backend.txt').trim()
+          }
+          if (fileExists('image-digest-frontend.txt')) {
+            frontDigest = readFile('image-digest-frontend.txt').trim()
+          }
+
+          echo "Read digest backend: '${backDigest}'"
+          echo "Read digest frontend: '${frontDigest}'"
+
+          if (!backDigest) {
+            echo "WARNING: backend digest vacío. Revisá push-backend.log en artifacts."
+          } else if (!(backDigest ==~ /sha256:[0-9a-f]{64}/)) {
+            echo "WARNING: backend digest no tiene formato sha256:... -> ${backDigest}"
+          } else {
+            echo "Backend digest OK: ${backDigest}"
+          }
+
+          if (!frontDigest) {
+            echo "WARNING: frontend digest vacío. Revisá push-frontend.log en artifacts."
+          } else if (!(frontDigest ==~ /sha256:[0-9a-f]{64}/)) {
+            echo "WARNING: frontend digest no tiene formato sha256:... -> ${frontDigest}"
+          } else {
+            echo "Frontend digest OK: ${frontDigest}"
+          }
+
+          // export para etapas posteriores si las necesitás
+          env.DIGEST_BACKEND = backDigest ?: ''
+          env.DIGEST_FRONTEND = frontDigest ?: ''
+        }
+      }
+    }
+
+    stage('Archive final artifacts') {
+      steps {
+        script {
+          sh '''
+            echo "Lista workspace (top):"
+            ls -la "${WORKDIR}" | sed -n '1,200p' || true
+            echo "Archivos generados:"
+            ls -la image-* push-*.log || true
+          '''
+        }
+        archiveArtifacts artifacts: 'image-*.txt,push-*.log,images-info.txt', fingerprint: true, allowEmptyArchive: true
+      }
+    }
+
+  } // end stages
+
+  post {
+    success { echo "Build-and-Push: OK" }
+    unstable { echo "Build-and-Push: UNSTABLE (revisar warnings)" }
+    failure { echo "Build-and-Push: FALLÓ" }
+    always {
+      sh 'echo "Workspace:"; ls -la || true'
+    }
+  }
+}
