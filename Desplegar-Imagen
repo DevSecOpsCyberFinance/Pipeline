@@ -1,0 +1,138 @@
+pipeline {
+  agent any
+  parameters {
+    string(name: 'PROJECT_PATH', defaultValue: '/projects/Cyberfinance-Bank-main', description: 'Ruta con docker-compose.yml')
+    string(name: 'IMAGE_OVERRIDE', defaultValue: '', description: '(Opcional) image:tag o image@sha256:... para forzar despliegue (se usa como imagen candidata, no como "service=image")')
+    booleanParam(name: 'FAIL_ON_NO_IMAGE', defaultValue: false, description: 'Si true -> falla si no se detecta imagen')
+  }
+  options { ansiColor('xterm'); timeout(time: 20, unit: 'MINUTES') }
+
+  stages {
+    stage('Elegir última imagen') {
+      steps {
+        script {
+          sh '''#!/bin/bash
+set -euo pipefail
+
+OUT=image-to-deploy.txt
+> "$OUT"
+
+# 1) If override provided -> use it
+if [ -n "${IMAGE_OVERRIDE:-}" ]; then
+  echo "${IMAGE_OVERRIDE}" > "$OUT"
+  echo "IMAGE_OVERRIDE -> $(cat $OUT)"
+  exit 0
+fi
+
+# 2) Build candidate list (prefer cyberfinance or localhost:5000 or tag ci-*)
+candidates=$(docker images --format '{{.Repository}} {{.Tag}} {{.ID}}' | awk '$1 ~ /cyberfinance/ || $1 ~ /localhost:5000/ || $2 ~ /^ci-/ {print $1":"$2" "$3}')
+if [ -z "$candidates" ]; then
+  candidates=$(docker images --format '{{.Repository}} {{.Tag}} {{.ID}}' | awk '$2 ~ /^ci-/ {print $1":"$2" "$3}')
+fi
+
+if [ -z "$candidates" ]; then
+  echo "No se encontraron images candidatas localmente."
+  if [ "${FAIL_ON_NO_IMAGE}" = "true" ]; then exit 2; else exit 0; fi
+fi
+
+# 3) Select newest by image.Created (inspect)
+best=""
+besttime=""
+while read -r repo_tag id; do
+  created=$(docker image inspect -f '{{.Created}}' "$id" 2>/dev/null || true)
+  if [ -z "$created" ]; then continue; fi
+  if [ -z "$besttime" ] || [[ "$created" > "$besttime" ]]; then
+    besttime="$created"; best="$repo_tag"
+  fi
+done <<< "$candidates"
+
+if [ -z "$best" ]; then
+  echo "No pudo determinar la última imagen."
+  if [ "${FAIL_ON_NO_IMAGE}" = "true" ]; then exit 3; else exit 0; fi
+fi
+
+echo "$best" > "$OUT"
+echo "Seleccionada: $best (creada: $besttime)"
+'''
+        }
+      }
+    }
+
+    stage('Retag sólo backend y frontend y deploy (compose)') {
+      steps {
+        script {
+          sh '''#!/bin/bash
+set -euo pipefail
+
+IMG="$(cat image-to-deploy.txt 2>/dev/null || true)"
+if [ -z "$IMG" ]; then
+  echo "No se indicó imagen a desplegar. Salida."
+  exit 0
+fi
+echo "Imagen a desplegar: $IMG"
+
+COMPOSE="${PROJECT_PATH%/}/docker-compose.yml"
+if [ ! -f "$COMPOSE" ]; then
+  echo "No se encontró docker-compose.yml en $PROJECT_PATH. Abortando."
+  exit 4
+fi
+
+# servicios objetivo que SÓLO se retagguearán
+TARGET_SERVICES=("backend" "frontend")
+
+# función: obtiene el valor de 'image:' para un service dado usando docker compose config
+get_service_image() {
+  local service="$1"
+  # Usamos docker compose config para normalizar compose; luego buscamos el bloque del servicio.
+  docker compose -f "$COMPOSE" config 2>/dev/null | awk -v svc="$service" '
+    $0 ~ "^services:" { in_services=1; next }
+    in_services && $0 ~ "^[a-zA-Z0-9_-]+:" { current=substr($1,1,length($1)-1); gsub(/:$/,"",current) }
+    in_services && current==svc && $1=="image:" { $1=""; sub(/^[[:space:]]+/,""); print $0; exit }
+  '
+}
+
+# lista de patrones "sistema" que nunca debemos retaggear si aparecen como target image
+SYSTEM_IMAGE_PATTERNS="^(mysql:|mariadb:|postgres:|postgresql:|redis:|mongo:|mongodb:|nginx:|httpd:|alpine:|busybox:)"
+
+for svc in "${TARGET_SERVICES[@]}"; do
+  tgt=$(get_service_image "$svc" || true)
+  if [ -z "$tgt" ]; then
+    echo "Compose no define image para el servicio '$svc' -> no se retaggea."
+    continue
+  fi
+
+  echo "Servicio '$svc' define imagen: '$tgt'"
+
+  # Si la imagen objetivo parece ser una imagen de sistema/DB, no la tocamos (por seguridad)
+  if [[ "$tgt" =~ $SYSTEM_IMAGE_PATTERNS ]]; then
+    echo "  -> Imagen objetivo '$tgt' parece ser imagen de sistema/DB. NO se retaggea."
+    continue
+  fi
+
+  # Retag: tag IMG -> tgt
+  echo "  -> Retag: $IMG -> $tgt"
+  docker tag "$IMG" "$tgt" || echo "  Aviso: docker tag falló (quizá ya existe)."
+done
+
+echo "Ejecutando docker compose up -d --remove-orphans en $PROJECT_PATH"
+cd "$PROJECT_PATH"
+docker compose up -d --remove-orphans
+echo "docker compose ps:"
+docker compose ps || true
+echo "Logs (tail 100):"
+docker compose logs --tail=100 || true
+'''
+        }
+      }
+    }
+  }
+
+  post {
+    always {
+      archiveArtifacts artifacts: 'image-to-deploy.txt', allowEmptyArchive: true
+      echo "Workspace: ${env.WORKSPACE}"
+    }
+    success { echo "Deploy: OK ✅" }
+    failure { echo "Deploy: FALLÓ ❌" }
+  }
+}
