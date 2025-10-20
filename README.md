@@ -24,6 +24,7 @@ Este pipeline automatiza todo el ciclo DevSecOps, combinando herramientas de an�
 
 
 🏗️ Infraestructura
+
 🐳 Container Runtime: Docker + Docker Compose
 🧭 Registry: Docker Registry privado
 ⚙️ CI/CD: Jenkins Pipeline
@@ -32,6 +33,7 @@ Este pipeline automatiza todo el ciclo DevSecOps, combinando herramientas de an�
 
 
 --- Plugin	Descripción ---
+
 workflow-aggregator	Pipeline como código
 
 credentials-binding	Manejo de secrets
@@ -48,6 +50,7 @@ artifact-archiver	Archivo de artefactos
 
 
 🔑 Credenciales Necesarias
+
 🪙 API Tokens
 --- Credential ID	Tipo	Uso ---
 
@@ -57,6 +60,7 @@ devsecops-registry-cred	Username/Password	Registry Docker
 
 
 🔐 Claves Criptográficas
+
 Credential ID	Tipo	Uso
 cosign-private-key	Secret File	Firma de imágenes
 
@@ -74,6 +78,7 @@ Función: Orquestación general de todo el proceso
 
 🧪 Jobs Especializados
 --- Job	Herramienta	Función ---
+
 
 Ingredientes/SAST	Semgrep	Análisis estático
 
