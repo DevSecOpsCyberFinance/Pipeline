@@ -9,6 +9,7 @@ Este pipeline automatiza todo el ciclo DevSecOps, combinando herramientas de an�
 
 🧰 Tecnologías Utilizadas
 🔐 Herramientas de Seguridad
+
 Tipo	Herramienta	Descripción
 🧠 SAST	Semgrep
  (Docker)	Análisis estático del código
@@ -18,12 +19,10 @@ Tipo	Herramienta	Descripción
  (Docker)	Análisis dinámico
 ✍️ Firma Digital	Cosign
 	Firma y verificación de imágenes
+
 🏗️ Infraestructura
-
 🐳 Container Runtime: Docker + Docker Compose
-
 🧭 Registry: Docker Registry privado
-
 ⚙️ CI/CD: Jenkins Pipeline
 
 🧩 Plugins Requeridos en Jenkins
