@@ -111,18 +111,3 @@ Ingredientes/Firmador/Desplegar-Imagen	Docker	Despliegue seguro
 🛰️ Network host habilitado para escaneos ZAP
 
 
-📂 Estructura de Proyecto Esperada
-/proyecto/
-├── Backend/
-│   ├── Dockerfile
-│   └── [código]
-├── Frontend/
-│   ├── Dockerfile
-│   └── [código]
-└── docker-compose.yml
-
-🏁 Próximos Pasos
-
-✅ Configurar las credenciales en Jenkins
-🛠️ Ajustar el pipeline a la estructura de tu proyecto
-🧪 Probar la ejecución en un entorno controlado antes de producción
