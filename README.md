@@ -12,10 +12,15 @@ Este pipeline automatiza todo el ciclo DevSecOps, combinando herramientas de an�
 🔐 Herramientas de Seguridad
 
 Tipo	Herramienta	Descripción
+
 🧠 SAST	Semgrep (Docker)	Análisis estático del código
+
 🧱 SCA	Snyk CLI	Escaneo de dependencias
+
 🌐 DAST	OWASP ZAP (Docker)	Análisis dinámico
+
 ✍️ Firma Digital	Cosign	Firma y verificación de imágenes
+
 
 🏗️ Infraestructura
 🐳 Container Runtime: Docker + Docker Compose
