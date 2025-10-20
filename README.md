@@ -8,17 +8,14 @@ Ideal para proyectos que buscan incorporar seguridad desde la etapa de desarroll
 Este pipeline automatiza todo el ciclo DevSecOps, combinando herramientas de análisis de seguridad, construcción y despliegue seguro de imágenes, y firma criptográfica para garantizar la integridad del software.
 
 🧰 Tecnologías Utilizadas
+
 🔐 Herramientas de Seguridad
 
 Tipo	Herramienta	Descripción
-🧠 SAST	Semgrep
- (Docker)	Análisis estático del código
-🧱 SCA	Snyk CLI
-	Escaneo de dependencias
-🌐 DAST	OWASP ZAP
- (Docker)	Análisis dinámico
-✍️ Firma Digital	Cosign
-	Firma y verificación de imágenes
+🧠 SAST	Semgrep (Docker)	Análisis estático del código
+🧱 SCA	Snyk CLI	Escaneo de dependencias
+🌐 DAST	OWASP ZAP (Docker)	Análisis dinámico
+✍️ Firma Digital	Cosign	Firma y verificación de imágenes
 
 🏗️ Infraestructura
 🐳 Container Runtime: Docker + Docker Compose
