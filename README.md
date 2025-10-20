@@ -11,7 +11,7 @@ Este pipeline automatiza todo el ciclo DevSecOps, combinando herramientas de an�
 
 🔐 Herramientas de Seguridad
 
-Tipo	Herramienta	Descripción
+--- Tipo	Herramienta	Descripción ---
 
 🧠 SAST	Semgrep (Docker)	Análisis estático del código
 
@@ -29,7 +29,9 @@ Tipo	Herramienta	Descripción
 ⚙️ CI/CD: Jenkins Pipeline
 
 🧩 Plugins Requeridos en Jenkins
-Plugin	Descripción
+
+
+--- Plugin	Descripción ---
 workflow-aggregator	Pipeline como código
 
 credentials-binding	Manejo de secrets
@@ -47,7 +49,8 @@ artifact-archiver	Archivo de artefactos
 
 🔑 Credenciales Necesarias
 🪙 API Tokens
-Credential ID	Tipo	Uso
+--- Credential ID	Tipo	Uso ---
+
 Synk-DevSecOps-cli	Secret Text	Token Snyk API
 
 devsecops-registry-cred	Username/Password	Registry Docker
@@ -68,8 +71,9 @@ cosign-key-passphrase	Secret Text	Passphrase
 
 Función: Orquestación general de todo el proceso
 
+
 🧪 Jobs Especializados
-Job	Herramienta	Función
+--- Job	Herramienta	Función ---
 
 Ingredientes/SAST	Semgrep	Análisis estático
 
