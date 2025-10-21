@@ -39,11 +39,9 @@ pipeline {
             
             echo "=== Preparando lista de imágenes para firmar ==="
             
-            # Crear archivo temporal con formato correcto
             rm -f images-to-sign-final.txt
             touch images-to-sign-final.txt
             
-            # Procesar backend
             if [ -f "image-digest-backend.txt" ] && [ -s "image-digest-backend.txt" ]; then
               BACK_DIGEST=$(cat image-digest-backend.txt | tr -d '\\r\\n' | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
               BACK_REF=$(cat image-ref-backend.txt | tr -d '\\r\\n' | sed 's/^[[:space:]]*//;s/[[:space:]]*$//' | sed -E 's|:[^/]*$||')
@@ -55,7 +53,6 @@ pipeline {
               fi
             fi
             
-            # Procesar frontend
             if [ -f "image-digest-frontend.txt" ] && [ -s "image-digest-frontend.txt" ]; then
               FRONT_DIGEST=$(cat image-digest-frontend.txt | tr -d '\\r\\n' | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
               FRONT_REF=$(cat image-ref-frontend.txt | tr -d '\\r\\n' | sed 's/^[[:space:]]*//;s/[[:space:]]*$//' | sed -E 's|:[^/]*$||')
@@ -67,7 +64,6 @@ pipeline {
               fi
             fi
             
-            # Verificar que tenemos imágenes para firmar
             if [ ! -s "images-to-sign-final.txt" ]; then
               echo "ERROR: No se encontraron imágenes para firmar"
               exit 1
@@ -96,7 +92,6 @@ pipeline {
               echo "Clave pública: $COSIGN_PUBLIC_KEY"
               echo "COSIGN_PASSWORD: ${COSIGN_PASSWORD}"
               
-              # Contador para tracking
               TOTAL_IMAGES=$(wc -l < images-to-sign-final.txt)
               CURRENT=1
               
@@ -105,11 +100,9 @@ pipeline {
                 echo "--- Procesando imagen $CURRENT de $TOTAL_IMAGES ---"
                 echo "Firmando: $IMAGE"
                 
-                # Firmar la imagen
                 if cosign sign --yes --allow-insecure-registry --key "$COSIGN_PRIVATE_KEY" "$IMAGE" 2>&1 | tee "cosign-sign-${CURRENT}.log"; then
                   echo "✅ Firma exitosa para: $IMAGE"
                   
-                  # Verificar la firma
                   if cosign verify --allow-insecure-registry --key "$COSIGN_PUBLIC_KEY" "$IMAGE" 2>&1 | tee "cosign-verify-${CURRENT}.log"; then
                     echo "✅ Verificación exitosa para: $IMAGE"
                   else
