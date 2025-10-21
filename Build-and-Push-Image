@@ -1,4 +1,3 @@
-// Jenkinsfile - Build-and-Push-Image (rsync -> build -> push -> digests)
 pipeline {
   agent any
 
@@ -28,7 +27,6 @@ pipeline {
           def backendImage = "${params.IMAGE_REPO_BASE}-backend:${tag}"
           def frontendImage = "${params.IMAGE_REPO_BASE}-frontend:${tag}"
 
-          // export para usar más abajo
           env.TAG = tag
           env.BACKEND_IMAGE = backendImage
           env.FRONTEND_IMAGE = frontendImage
@@ -47,8 +45,6 @@ pipeline {
     stage('Sync project to workspace (rsync)') {
       steps {
         script {
-          // Copiamos todo el proyecto al workspace para evitar dependencias de rutas host
-          // exclude opcionales: node_modules, .git, target, etc.
           sh '''
             set -euo pipefail
             echo "Sincronizando ${PROJECT_PATH} -> ${WORKSPACE}/src (rsync)"
@@ -108,7 +104,6 @@ pipeline {
     stage('Push images & obtener digests') {
       steps {
         script {
-          // Genero un script con placeholders (para evitar problemas de $/${} en Groovy)
           writeFile file: 'do_push.sh', text: '''#!/bin/bash
 set -euo pipefail
 echo "START PUSH SCRIPT"
@@ -163,7 +158,6 @@ echo "image-digest-frontend.txt content:"; cat image-digest-frontend.txt || true
 ls -la || true
 '''
 
-          // reemplazo placeholders por los valores reales (safe con sed usando delimitador |)
           sh """
             chmod +x do_push.sh
             sed -i 's|__BACKEND_IMAGE__|${env.BACKEND_IMAGE}|g' do_push.sh
@@ -211,7 +205,6 @@ ls -la || true
             echo "Frontend digest OK: ${frontDigest}"
           }
 
-          // export para etapas posteriores si las necesitás
           env.DIGEST_BACKEND = backDigest ?: ''
           env.DIGEST_FRONTEND = frontDigest ?: ''
         }
@@ -232,7 +225,7 @@ ls -la || true
       }
     }
 
-  } // end stages
+  } 
 
   post {
     success { echo "Build-and-Push: OK" }
