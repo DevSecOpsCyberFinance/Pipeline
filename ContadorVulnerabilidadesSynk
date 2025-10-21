@@ -86,7 +86,6 @@ pipeline {
 
           jsonFiles.each { path ->
             try {
-              // readJSON es seguro desde Pipeline Utility Steps (si no lo tenés, instalalo).
               def parsed = null
               try {
                 parsed = readJSON file: path
@@ -130,7 +129,7 @@ pipeline {
               echo "ERROR parsing ${path}: ${err}"
               perFile << [file:path, error:err.toString()]
             }
-          } // jsonFiles.each
+          } 
 
           def result = [generatedAt:new Date().toString(), totals:totals, files:perFile]
           writeFile file: "${OUT_DIR}/vulnerability-summary.json", text: groovy.json.JsonOutput.prettyPrint(groovy.json.JsonOutput.toJson(result))
