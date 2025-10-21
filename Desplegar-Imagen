@@ -17,14 +17,12 @@ set -euo pipefail
 OUT=image-to-deploy.txt
 > "$OUT"
 
-# 1) If override provided -> use it
 if [ -n "${IMAGE_OVERRIDE:-}" ]; then
   echo "${IMAGE_OVERRIDE}" > "$OUT"
   echo "IMAGE_OVERRIDE -> $(cat $OUT)"
   exit 0
 fi
 
-# 2) Build candidate list (prefer cyberfinance or localhost:5000 or tag ci-*)
 candidates=$(docker images --format '{{.Repository}} {{.Tag}} {{.ID}}' | awk '$1 ~ /cyberfinance/ || $1 ~ /localhost:5000/ || $2 ~ /^ci-/ {print $1":"$2" "$3}')
 if [ -z "$candidates" ]; then
   candidates=$(docker images --format '{{.Repository}} {{.Tag}} {{.ID}}' | awk '$2 ~ /^ci-/ {print $1":"$2" "$3}')
@@ -35,7 +33,6 @@ if [ -z "$candidates" ]; then
   if [ "${FAIL_ON_NO_IMAGE}" = "true" ]; then exit 2; else exit 0; fi
 fi
 
-# 3) Select newest by image.Created (inspect)
 best=""
 besttime=""
 while read -r repo_tag id; do
@@ -77,10 +74,8 @@ if [ ! -f "$COMPOSE" ]; then
   exit 4
 fi
 
-# servicios objetivo que SÓLO se retagguearán
 TARGET_SERVICES=("backend" "frontend")
 
-# función: obtiene el valor de 'image:' para un service dado usando docker compose config
 get_service_image() {
   local service="$1"
   # Usamos docker compose config para normalizar compose; luego buscamos el bloque del servicio.
@@ -91,7 +86,6 @@ get_service_image() {
   '
 }
 
-# lista de patrones "sistema" que nunca debemos retaggear si aparecen como target image
 SYSTEM_IMAGE_PATTERNS="^(mysql:|mariadb:|postgres:|postgresql:|redis:|mongo:|mongodb:|nginx:|httpd:|alpine:|busybox:)"
 
 for svc in "${TARGET_SERVICES[@]}"; do
